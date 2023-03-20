@@ -1,0 +1,430 @@
+---
+title: "PSTAT231 - Fetal Health Classification"
+author: "Andrew Nguyen"
+date: "`r Sys.Date()`"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(glmnet)
+
+library(ggcorrplot) # correlation
+library(themis)     # upsampling
+
+# packages for models
+library(kknn)       # KNN 
+library(rpart.plot) # for plotting decision tree
+library(xgboost)    # boosted trees
+library(vip)        # variable importance plots (for tree-based models)
+```
+
+# Introduction 
+
+Fetal mortality is an important factor into the success of the healthcare system of a country. With inaccurate insight into the health of a fetus could lead to devastating news to families. The goal of this project is to determine whether a machine learning model can predict the health of a fetus given cardiotocography (CTG) data, which monitors fetal heartbeat and uterine contractions. The data has been acquired from [Kaggle](https://www.kaggle.com/datasets/andrewmvd/fetal-health-classification).
+
+
+The variable we are interested in predicting is `fetal_health`, which contains three different classes of the health of the fetus:
+
+-   1: Normal
+-   2: Suspect
+-   3: Pathological
+
+Determining fetal health is an extremely important task, as any misinterpretation could leave to devastating consequences. We want to see if a machine learning model can correctly classify the health of the fetus. We will be examining 4 possible models to determine which model will most accurately predict fetal health. The project will go through 3 main stages:
+
+1. Exploratory Data Analysis (EDA)
+2. Model Fitting
+3. Testing Best Model(s)
+
+
+# Exploratory Data Analysis (EDA)
+We begin with reading in the data along with general description of the data set. (*Note: Since we are working with classification, we will convert our response variable `fetal_health` into a factor)
+
+```{R, echo = FALSE, message = FALSE}
+fetus <- read_csv("data/fetal_health.csv"); head(fetus)
+
+# making response variable a factor
+fetus$fetal_health <- as.factor(fetus$fetal_health)
+```
+
+```{R}
+dim(fetus) # Get dimensions of data, as well as count any NA values. 
+sum(is.na(fetus)) # number of NA values
+```
+
+We have a little over 2126 observations of data with 22 variables to work with, and **k-fold cross validation** will be considered for our model training. Additionally, we have no NA values, so no removal of rows or imputation will be needed. 
+
+For further context of our data set, each column with their respective description will be provided below:
+
+- `baseline value` - Baseline Fetal Heart Rate (FHR)
+- `accelerations` - Number of accelerations per second (increases in heart rate)
+- `fetal_movement` - Number of fetal movements per second
+- `uterine_contractions` - Number of uterine contractions per second          
+- `light_decelerations` - Number of LDs per second                                   
+- `severe_decelerations` - Number of SDs per second                                 
+- `prolongued_decelerations` - Number of PDs per second                            
+- `abnormal_short_term_variability` - Percentage of time with abnormal short term variability
+- `mean_value_of_short_term_variability` - Mean value of short term variability                 
+- `percentage_of_time_with_abnormal_long_term_variability` - Percentage of time with abnormal long term variability
+- `mean_value_of_long_term_variability` - Mean value of long term variability                  
+- `histogram_width` - Width of the histogram made using all values from a record        
+- `histogram_min` - Histogram minimum value                                        
+- `histogram_max` - Histogram maximum value                                        
+- `histogram_number_of_peaks` - Number of peaks in the exam histogram                          
+- `histogram_number_of_zeroes` - Number of zeroes in the exam histogram                           
+- `histogram_mode` - Histogram mode                                       
+- `histogram_mean` - Histogram mean
+- `histogram_median` - Histogram median                                     
+- `histogram_variance` - Histogram variance                                   
+- `histogram_tendency` - Histogram tendency                                  
+- `fetal_health` - fetal health (1 = Normal, 2 = Suspect , 3 = Pathological)
+
+We can first detect that all rows with `histogram` is information regarding a plot of all values, which do not hold any relevance to our prediction as CTG mainly measure fetal heart rate (`baseline value`) and uterine movement. Additionally, there are a few columns that are closely related to each other (including max, min, variance, etc.), and we will go ahead and extract only `mean` columns. 
+
+```{R}
+# extract columns
+fetus <- dplyr::select(fetus , c("baseline value", 
+                          "accelerations", 
+                          "fetal_movement", 
+                          "uterine_contractions", 
+                          "light_decelerations",
+                          "severe_decelerations", 
+                          "prolongued_decelerations", 
+                          "abnormal_short_term_variability",
+                          "mean_value_of_short_term_variability", 
+                          "mean_value_of_long_term_variability", 
+                          "fetal_health"))
+```
+
+Let's gain some more insight of our data by observing the class distribution of the response variable. 
+
+```{R}
+ggplot(data = fetus, aes(x = fetal_health)) + 
+  geom_bar(fill = c("#ffb4a2", "#e5989b", "#b5838d")) + 
+  xlab("Fetal Health Class")
+```
+
+As we see there is a significant imbalance between normal and suspect/pathological classes, we would infer that **upsampling** is necessary when training for our models. We can then observe any correlation between the variables using a correlation matrix.
+
+```{R}
+model.matrix(~0+., data=fetus) %>% 
+  cor(use="pairwise.complete.obs") %>% 
+  ggcorrplot(show.diag=FALSE, type="lower", lab=TRUE, lab_size=2) +
+  theme(axis.text.x=element_text(size=8, angle=50, vjust=1, hjust=1, 
+                                 margin=margin(-3,0,0,0)),
+        axis.text.y=element_text(size=8, margin=margin(0,-3,0,0)),
+        panel.grid.major=element_blank()) 
+```
+
+We can observe that there is a good spread of correlation, and we can see that `accelerations` and `uterine_contractions` have a high correlation to normal fetal health. We can see that `abnormal_short_term_variability` and `accelerations` include a large correlation with fetal health. Further analysis into the distribution of classes with these factors are as follows:
+
+```{R}
+ggplot(fetus, aes(x = accelerations)) +
+  geom_histogram(aes(color = fetal_health, fill = fetal_health), 
+                position = "identity", bins = 30, alpha = 0.4) +
+  scale_color_manual(values = c("#ffb4a2", "#e5989b", "#b5838d")) +
+  scale_fill_manual(values = c("#ffb4a2", "#e5989b", "#b5838d")) +
+  ggtitle("Histogram of Fetal Heart Rate Acclerations by Fetal Health")
+```
+
+```{R}
+ggplot(fetus, aes(x = abnormal_short_term_variability)) +
+  geom_histogram(aes(color = fetal_health, fill = fetal_health), 
+                position = "identity", bins = 30, alpha = 0.4) +
+  scale_color_manual(values = c("#ffb4a2", "#e5989b", "#b5838d")) +
+  scale_fill_manual(values = c("#ffb4a2", "#e5989b", "#b5838d")) +
+  ggtitle("Histogram of Abnormal Short Term Variability by Fetal Health")
+```
+We can see that number accelerations in heart rate are generally more normal within normal fetal health, but consistently low amounts of accelerations may correlate to pathological or suspect fetal health. 
+
+There is a relation in the magnitude of abnormal short term variability with the fetal health class, as higher values of abnormal short term variability tends to be related to suspect or pathological classes. Despite this, there is still an unclear distinction between the classes, and would require further variables to guide the classification. Now that we have explored our data, we will continue onward towards making recipes for model fitting. 
+
+# Model Fitting
+
+## Data Split + Cross Validation
+Before we begin model fitting, we will separate our data set into train and test sets to validate the performance of our models. Additionally, since we have a large data set (2126 observations), we will set up folds for k-fold cross validation. K-fold cross validation is used to ensure that each observation has a chance to be tested on, as we want to validate the performance of our models _without_ using the test set. 
+
+```{R eval = FALSE}
+set.seed(1000)
+fetal_data_split <- initial_split(fetus, prop = 0.7, strata = fetal_health)
+fetal_training <- training(fetal_data_split)
+fetal_test <- testing(fetal_data_split)
+
+# establish folds for cross validation
+fetal_folds <- vfold_cv(fetal_training, v = 10, strata = fetal_health)
+
+# save results for later
+save(fetal_training, file = "data/saved/fetal_training.rda")
+save(fetal_test, file = "data/saved/fetal_test.rda")
+save(fetal_folds, file = "data/saved/fetal_folds.rda")
+```
+
+```{R}
+load("data/saved/fetal_training.rda")
+load("data/saved/fetal_test.rda")
+load("data/saved/fetal_folds.rda")
+```
+
+This project will explore various models to determine which is most accurate in determining the health of a fetus. We will consider the following models:
+- k-nearest neighbors
+- decision tree
+- random forest
+<!-- - naive bayes -->
+- gradient boosted trees
+
+## Writing Recipe
+As shown earlier, we have recognized the large class imbalance in our data, we will ensure that we will compensate for this using the `themis` package to upsample, or replicate samples so that all classes have equal number of counts. We also normalized all of our predictors since our data isn't all on the same scale.
+```{R}
+# write recipe
+fetus_recipe <- recipe(fetal_health ~ ., data = fetal_training) %>% 
+  step_upsample(fetal_health, over_ratio = 0.5, skip = TRUE) %>%
+  step_normalize(all_predictors())
+```
+
+## Writing Models + Workflow
+The following section will 
+```{R}
+# KNN
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kknn")
+
+knn_wflow <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(fetus_recipe)
+
+knn_grid <- grid_regular(neighbors(range = c(1, 10)), 
+                         levels = 10)
+
+# Decision Tree (dt)
+dt_model <- decision_tree(cost_complexity = tune()) %>%
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+dt_wflow <- workflow() %>%
+  add_model(dt_model) %>%
+  add_recipe(fetus_recipe)
+
+dt_grid <- grid_regular(cost_complexity(range = c(-3, 1)), 
+                        levels = 10)
+# Random Forest
+rf_model <- rand_forest(mtry = tune(),
+                        trees = tune(), 
+                        min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+rf_wflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(fetus_recipe)
+
+rf_grid <- grid_regular(mtry(range = c(1, 10)), 
+                       trees(range = c(100, 600)), 
+                       min_n(range = c(10, 20)),
+                       levels = 5)
+
+# Gradient Boosted Trees
+bt_model <- boost_tree(mtry = tune(), 
+                       trees = tune(), 
+                       learn_rate = tune()) %>%
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+bt_wflow <- workflow() %>%
+  add_model(bt_model) %>%
+  add_recipe(fetus_recipe)
+
+bt_grid <- grid_regular(mtry(range = c(1, 10)), 
+                       trees(range = c(100, 800)), 
+                       learn_rate(range = c(-10, -1)),
+                       levels = 5)
+```
+
+## Fitting Models
+In order to determine which model will be able to best predict fetal health given CTG data, we need to fit our models to our training models while also using tuning grids to determine the absolute best model using `roc_auc`, a metric that essentially measures its ability to distinguish between classes -- the higher the value, the more accurate the model. 
+
+### K Nearest Neighbors
+
+#### Model Tuning 
+```{R eval = FALSE}
+knn_tune <- tune_grid(
+  knn_wflow, 
+  resamples = fetal_folds,
+  grid = knn_grid
+)
+save(knn_tune, file = "model_results/knn_tune.rda")
+```
+
+Load in saved .rda file for K Nearest Neighbors fit.
+```{R}
+load("model_results/knn_tune.rda")
+
+autoplot(knn_tune) + theme_minimal()
+```
+
+We can see that there is a trade off between increasing number of neighbors, as increasing # neighbors increases ROC_AUC at the cost of decreasing accuracy. We can then extract the best model and fit to the test set. 
+
+#### Best Model
+```{R}
+best_knn <- show_best(knn_tune, metric = 'roc_auc', n = 1); best_knn
+```
+
+Our best K Nearest Neighbors model has achieved a training `roc_auc` value of 0.936, with best `neighbors = 10`,  which is already very accurate! We will look onward to the next model for possibility of an even more accurate model. 
+
+### Decision Tree
+
+#### Model Tuning
+```{R eval = FALSE}
+dt_tune <- tune_grid(
+  dt_wflow, 
+  resamples = fetal_folds,
+  grid = dt_grid
+)
+save(dt_tune, file = "model_results/dt_tune.rda")
+```
+
+
+```{R}
+load("model_results/dt_tune.rda")
+
+autoplot(dt_tune) + theme_minimal()
+```
+
+After our tuning of decision tree model, we can see that with increasing cost complexity, we briefly have an increase in accuracy, but eventually face a decrease in both accuracy and roc_auc  value. We will go ahead and extract the best model to test against the test set. 
+
+#### Best Model
+```{R}
+best_dt <- show_best(dt_tune, metric = 'roc_auc', n = 1); best_dt
+```
+
+With our best decision tree model with a training `roc_auc` value of 0.895. This model performed worse than the KNN model, which performed better by about 0.041.
+
+
+### Random Forest
+
+#### Model Tuning
+```{R eval = FALSE}
+rf_tune <- tune_grid(
+  rf_wflow, 
+  resamples = fetal_folds,
+  grid = rf_grid
+)
+save(rf_tune, file = "model_results/rf_tune.rda")
+```
+
+
+```{R}
+load("model_results/rf_tune.rda")
+
+autoplot(rf_tune) + theme_minimal()
+```
+
+After our tuning of random forest model, we can see that with randomly selected predictors, there is a sweet spot where there is highest `roc_auc` and accuracy, and then dramatically decrease. With increasing minimal node size there is a marginal increase in accuracy and `roc_auc`, and lastly with increasing trees there is a slight marginal increase in `roc_auc`. We will go ahead and extract the best model below:
+
+#### Best Model 
+```{R}
+best_rf <- show_best(rf_tune, metric = 'roc_auc', n = 1); best_rf
+```
+
+We have exceptional training performance of 0.972 with model parameters (`mtry = 3`, `trees = 350`, `min_n = 10`), which is now the best performing model, with 0.036 better than our KNN model. We'll see if boosted trees will perform better than our random forest model. 
+
+
+### Boosted Trees
+
+#### Model Tuning
+```{R eval = FALSE}
+bt_tune <- tune_grid(
+  bt_wflow, 
+  resamples = fetal_folds,
+  grid = bt_grid
+)
+save(bt_tune, file = "model_results/bt_tune.rda")
+```
+
+```{R}
+load("model_results/bt_tune.rda")
+
+autoplot(bt_tune) + theme_minimal()
+```
+
+
+With an increasing learning rate, we see an increase in `accuracy` and `roc_auc`, and a marginal increase in `accuracy` and `roc_auc`with increasing randomly selected predictors. 
+
+#### Best Model 
+```{R}
+best_bt <- show_best(bt_tune, metric = 'roc_auc', n = 1); best_bt
+```
+
+Our boosted tree model performed just marginally worse than our random forest model with parameters (`mtry = 3`, `trees = 100`, `learn_rate = 100`), barely under performing by 0.001. Given that these two models performed identically to that of our random forest model, we will consider both of these models in our final fit against the test set. 
+
+
+# Testing Best Model(s)
+Our best two models, Random Forest and Boosted Tree models performed the best (refer to summarized table below) and we will proceed to testing against our test set to determine the best model. 
+
+```{R}
+# building summary table
+model_summary <- data.frame(Model = c("KNN", 
+                                      "Decision Tree", 
+                                      "Random Forest",
+                                      "Boosted Tree"), 
+                            roc_auc = c(0.9362348,
+                                        0.8948902,
+                                        0.9720392,
+                                        0.9714598))
+model_summary[order(model_summary$roc_auc, decreasing = TRUE),]
+```
+## Testing Models 
+```{R}
+best_rf <- show_best(rf_tune, metric = 'roc_auc', n = 1) # extract best model again
+best_rf <- finalize_workflow(rf_wflow, best_rf)
+
+best_rf_model_test <- fit(best_rf, fetal_training) # fitting to test set
+
+final_rf_test <- augment(best_rf_model_test, fetal_test)%>% 
+  dplyr::select(fetal_health, starts_with(".pred")) 
+
+roc_auc(final_rf_test, truth = fetal_health, .pred_1:.pred_3) # get roc_auc value
+```
+```{R}
+best_bt <- show_best(bt_tune, metric = 'roc_auc', n = 1) # extract best model again
+best_bt <- finalize_workflow(bt_wflow, best_bt)
+
+best_bt_model_test <- fit(best_bt, fetal_training) # fitting to test set
+
+final_bt_test <- augment(best_bt_model_test, fetal_test)%>% 
+  dplyr::select(fetal_health, starts_with(".pred")) 
+
+roc_auc(final_bt_test, truth = fetal_health, .pred_1:.pred_3) # get roc_auc value
+```
+
+We can see that our boosted tree model performed roughly 0.05 better than our random forest model. Therefore, our boosted tree model performed the best. In comparison to our training `roc_auc` (0.971), it actually performed well on the test set, meaning there is little signs of overfitting. It must be considered that some predictors (for example, `light_decelerations` and `severe_decelerations`) may be correlated with each other, and that this would mean that there is no complete multicollinearity in our data. We will further explore our model: 
+
+```{R}
+best_bt_model_test %>% extract_fit_parsnip() %>% 
+  vip() +
+  theme_minimal()
+```
+
+We can see that our most impactful predictor was `abnormal_short_term_variability`, which was correctly identified in our correlation matrix and further explored in our histogram plots. 
+
+```{R}
+roc_curve(final_bt_test, truth = fetal_health, .pred_1:.pred_3) %>%
+  autoplot()
+
+conf_mat(final_bt_test, truth = fetal_health, 
+         .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+Our ROC_AUC curves look great, especially in classification for class 3 (pathological), and it also reflects in our confusion matrix. We do see our largest misclassification is for class 2 (suspect), but it is reasonable given the overlap between class 1 and class 2 in our histograms in our EDA section. Therefore, we conclude that our best model to predict fetal health given CTG data is a boosted tree model with parameters (`mtry = 3`, `trees = 100`, `learn_rate = 100`). 
+
+
+# Conclusion
+
+We conclude that our best performing model to predict fetal health was a boosted tree model with a testing `roc_auc` value of 0.971. Although we have exceptional test results, this does not mean this is ready for public use, especially when we are determining the life expectancy of a fetus. Life expectancy can be deduced from a myriad of factors, not from just CTG data. Therefore, further research into predicting fetal health from a machine learning model would include additional predictors, such as any symptoms, hygiene, diet, and even genetics. Although this model isn't ready for real life application, it is definitely the first step. 
+
